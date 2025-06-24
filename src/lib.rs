@@ -496,7 +496,7 @@ impl State {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        self.window.request_redraw();
+        // self.window.request_redraw();
 
         // We can't render unless the surface is configured
         if !self.is_surface_configured {
@@ -644,7 +644,9 @@ impl ApplicationHandler<State> for App {
             WindowEvent::RedrawRequested => {
                 state.update();
                 match state.render() {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        state.window.request_redraw();
+                    }
                     // Reconfigure the surface if it's lost or outdated
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                         let size = state.window.inner_size();
