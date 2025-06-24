@@ -283,7 +283,7 @@ impl State {
             desired_maximum_frame_latency: 2,
         };
 
-        let diffuse_bytes = include_bytes!("/Users/adarsh/Downloads/happy-tree.png");
+        let diffuse_bytes = include_bytes!("../test/happy-tree.png");
         let diffuse_texture =
             texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "happy-tree.png").unwrap();
 
