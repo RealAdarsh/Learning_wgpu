@@ -1,18 +1,14 @@
-use std::{iter, sync::Arc};
+use std::{iter, time::{Duration, Instant}};
 
 use wgpu::util::DeviceExt;
-use winit::{
-    application::ApplicationHandler,
-    event::*,
-    event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
-    window::Window,
-};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
 mod texture;
+mod drm_surface;
+
+use drm_surface::DrmSurface;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -115,177 +111,108 @@ impl CameraUniform {
 
 struct CameraController {
     speed: f32,
-    is_up_pressed: bool,
-    is_down_pressed: bool,
-    is_forward_pressed: bool,
-    is_backward_pressed: bool,
-    is_left_pressed: bool,
-    is_right_pressed: bool,
+    rotation_speed: f32,
 }
 
 impl CameraController {
     fn new(speed: f32) -> Self {
         Self {
             speed,
-            is_up_pressed: false,
-            is_down_pressed: false,
-            is_forward_pressed: false,
-            is_backward_pressed: false,
-            is_left_pressed: false,
-            is_right_pressed: false,
+            rotation_speed: 1.0,
         }
     }
 
-    fn handle_key(&mut self, key: KeyCode, is_pressed: bool) -> bool {
-        match key {
-            KeyCode::Space => {
-                self.is_up_pressed = is_pressed;
-                true
-            }
-            KeyCode::ShiftLeft => {
-                self.is_down_pressed = is_pressed;
-                true
-            }
-            KeyCode::KeyW | KeyCode::ArrowUp => {
-                self.is_forward_pressed = is_pressed;
-                true
-            }
-            KeyCode::KeyA | KeyCode::ArrowLeft => {
-                self.is_left_pressed = is_pressed;
-                true
-            }
-            KeyCode::KeyS | KeyCode::ArrowDown => {
-                self.is_backward_pressed = is_pressed;
-                true
-            }
-            KeyCode::KeyD | KeyCode::ArrowRight => {
-                self.is_right_pressed = is_pressed;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn update_camera(&self, camera: &mut Camera) {
+    fn update_camera(&self, camera: &mut Camera, dt: Duration) {
         use cgmath::InnerSpace;
-        let forward = camera.target - camera.eye;
-        let forward_norm = forward.normalize();
-        let forward_mag = forward.magnitude();
-
-        // Prevents glitching when camera gets too close to the
-        // center of the scene.
-        if self.is_forward_pressed && forward_mag > self.speed {
-            camera.eye += forward_norm * self.speed;
-        }
-        if self.is_backward_pressed {
-            camera.eye -= forward_norm * self.speed;
-        }
-
-        let right = forward_norm.cross(camera.up);
-
-        // Redo radius calc in case the up/ down is pressed.
-        let forward = camera.target - camera.eye;
-        let forward_mag = forward.magnitude();
-
-        if self.is_right_pressed {
-            // Rescale the distance between the target and eye so
-            // that it doesn't change. The eye therefore still
-            // lies on the circle made by the target and eye.
-            camera.eye = camera.target - (forward + right * self.speed).normalize() * forward_mag;
-        }
-        if self.is_left_pressed {
-            camera.eye = camera.target - (forward - right * self.speed).normalize() * forward_mag;
-        }
+        
+        // Simple automatic rotation for demo
+        let rotation = self.rotation_speed * dt.as_secs_f32();
+        let current_radius = (camera.eye - camera.target).magnitude();
+        
+        // Rotate around Y axis
+        let angle = rotation;
+        let new_x = camera.eye.x * angle.cos() - camera.eye.z * angle.sin();
+        let new_z = camera.eye.x * angle.sin() + camera.eye.z * angle.cos();
+        
+        camera.eye.x = new_x;
+        camera.eye.z = new_z;
+        
+        // Normalize to maintain distance
+        let direction = (camera.eye - camera.target).normalize();
+        camera.eye = camera.target + direction * current_radius;
     }
 }
 
 pub struct State {
-    surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    is_surface_configured: bool,
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
-    #[allow(dead_code)]
     diffuse_texture: texture::Texture,
     diffuse_bind_group: wgpu::BindGroup,
-    // NEW!
     camera: Camera,
     camera_controller: CameraController,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    window: Arc<Window>,
+    drm_surface: DrmSurface,
+    last_update: Instant,
+    // Offscreen rendering
+    offscreen_texture: wgpu::Texture,
+    offscreen_view: wgpu::TextureView,
+    width: u32,
+    height: u32,
 }
 
 impl State {
-    async fn new(window: Arc<Window>) -> anyhow::Result<State> {
-        let size = window.inner_size();
+    async fn new() -> anyhow::Result<State> {
+        // Create DRM surface first
+        let drm_surface = DrmSurface::new()?;
+        let (width, height) = drm_surface.get_size();
 
         // The instance is a handle to our GPU
-        // BackendBit::PRIMARY => Vulkan + Metal + DX12 + Browser WebGPU
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            #[cfg(not(target_arch = "wasm32"))]
-            backends: wgpu::Backends::PRIMARY,
-            #[cfg(target_arch = "wasm32")]
-            backends: wgpu::Backends::GL,
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
             ..Default::default()
         });
 
-        let surface = instance.create_surface(window.clone()).unwrap();
-
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: Some(&surface),
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None, // No surface needed for offscreen rendering
                 force_fallback_adapter: false,
             })
-            .await
-            .unwrap();
+            .await?;
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::empty(),
-                // WebGL doesn't support all of wgpu's features, so if
-                // we're building for the web we'll have to disable some.
-                required_limits: if cfg!(target_arch = "wasm32") {
-                    wgpu::Limits::downlevel_webgl2_defaults()
-                } else {
-                    wgpu::Limits::default()
-                },
+                required_limits: wgpu::Limits::default(),
                 memory_hints: Default::default(),
-                trace: wgpu::Trace::Off, // Trace path
+                trace: wgpu::Trace::Off,
             })
-            .await
-            .unwrap();
+            .await?;
 
-        let surface_caps = surface.get_capabilities(&adapter);
-        // Shader code in this tutorial assumes an Srgb surface texture. Using a different
-        // one will result all the colors comming out darker. If you want to support non
-        // Srgb surfaces, you'll need to account for that when drawing to the frame.
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
+        // Create offscreen texture for rendering
+        let offscreen_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Offscreen Texture"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let offscreen_view = offscreen_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let diffuse_bytes = include_bytes!("../test/happy-tree.png");
         let diffuse_texture =
-            texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "happy-tree.png").unwrap();
+            texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "happy-tree.png")?;
 
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -329,7 +256,7 @@ impl State {
             eye: (0.0, 1.0, 2.0).into(),
             target: (0.0, 0.0, 0.0).into(),
             up: cgmath::Vector3::unit_y(),
-            aspect: config.width as f32 / config.height as f32,
+            aspect: width as f32 / height as f32,
             fovy: 45.0,
             znear: 0.1,
             zfar: 100.0,
@@ -394,7 +321,7 @@ impl State {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format: wgpu::TextureFormat::Bgra8UnormSrgb,
                     blend: Some(wgpu::BlendState {
                         color: wgpu::BlendComponent::REPLACE,
                         alpha: wgpu::BlendComponent::REPLACE,
@@ -408,12 +335,8 @@ impl State {
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: Some(wgpu::Face::Back),
-                // Setting this to anything other than Fill requires Features::POLYGON_MODE_LINE
-                // or Features::POLYGON_MODE_POINT
                 polygon_mode: wgpu::PolygonMode::Fill,
-                // Requires Features::DEPTH_CLIP_CONTROL
                 unclipped_depth: false,
-                // Requires Features::CONSERVATIVE_RASTERIZATION
                 conservative: false,
             },
             depth_stencil: None,
@@ -422,10 +345,7 @@ impl State {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            // If the pipeline will be used with a multiview render pass, this
-            // indicates how many array layers the attachments will have.
             multiview: None,
-            // Useful for optimizing shader compilation on Android
             cache: None,
         });
 
@@ -442,11 +362,8 @@ impl State {
         let num_indices = INDICES.len() as u32;
 
         Ok(Self {
-            surface,
             device,
             queue,
-            config,
-            is_surface_configured: false,
             render_pipeline,
             vertex_buffer,
             index_buffer,
@@ -458,35 +375,21 @@ impl State {
             camera_buffer,
             camera_bind_group,
             camera_uniform,
-            window,
+            drm_surface,
+            last_update: Instant::now(),
+            offscreen_texture,
+            offscreen_view,
+            width,
+            height,
         })
     }
 
-    pub fn window(&self) -> &Window {
-        &self.window
-    }
-
-    fn resize(&mut self, width: u32, height: u32) {
-        if width > 0 && height > 0 {
-            self.is_surface_configured = true;
-            self.config.width = width;
-            self.config.height = height;
-            self.surface.configure(&self.device, &self.config);
-
-            self.camera.aspect = self.config.width as f32 / self.config.height as f32;
-        }
-    }
-
-    fn handle_key(&mut self, event_loop: &ActiveEventLoop, key: KeyCode, pressed: bool) {
-        if key == KeyCode::Escape && pressed {
-            event_loop.exit();
-        } else {
-            self.camera_controller.handle_key(key, pressed);
-        }
-    }
-
     fn update(&mut self) {
-        self.camera_controller.update_camera(&mut self.camera);
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_update);
+        self.last_update = now;
+
+        self.camera_controller.update_camera(&mut self.camera, dt);
         self.camera_uniform.update_view_proj(&self.camera);
         self.queue.write_buffer(
             &self.camera_buffer,
@@ -495,19 +398,8 @@ impl State {
         );
     }
 
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        // self.window.request_redraw();
-
-        // We can't render unless the surface is configured
-        if !self.is_surface_configured {
-            return Ok(());
-        }
-
-        let output = self.surface.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
+    fn render(&mut self) -> Result<(), anyhow::Error> {
+        // Render to offscreen texture instead of surface
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -518,7 +410,7 @@ impl State {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &self.offscreen_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -543,164 +435,151 @@ impl State {
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
-        self.queue.submit(iter::once(encoder.finish()));
-        output.present();
+        // Create buffer to copy texture data to CPU
+        let bytes_per_pixel = 4; // BGRA format
+        let unpadded_bytes_per_row = self.width * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = ((unpadded_bytes_per_row + align - 1) / align) * align;
+        let buffer_size = (padded_bytes_per_row * self.height) as u64;
+        
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Output Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
 
+        // Copy texture to buffer
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.offscreen_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &output_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.queue.submit(iter::once(encoder.finish()));
+
+        // Map the buffer and copy to DRM framebuffer
+        let buffer_slice = output_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+
+        // Wait for the mapping to complete
+        let _ = self.device.poll(wgpu::MaintainBase::Wait);
+        
+        // Check if mapping succeeded
+        if receiver.recv().unwrap().is_ok() {
+            let data = buffer_slice.get_mapped_range();
+            
+            // Convert BGRA to RGB for framebuffer, handling row padding
+            let mut rgb_data = Vec::with_capacity((self.width * self.height * 3) as usize);
+            
+            for y in 0..self.height {
+                let row_start = (y * padded_bytes_per_row) as usize;
+                for x in 0..self.width {
+                    let pixel_start = row_start + (x * bytes_per_pixel) as usize;
+                    if pixel_start + 3 < data.len() {
+                        // BGRA -> RGB conversion
+                        rgb_data.push(data[pixel_start + 2]); // R
+                        rgb_data.push(data[pixel_start + 1]); // G
+                        rgb_data.push(data[pixel_start + 0]); // B
+                    }
+                }
+            }
+            
+            // Write frame to framebuffer
+            if let Err(e) = self.drm_surface.write_frame(&rgb_data) {
+                log::warn!("Failed to write frame to framebuffer: {}", e);
+            }
+            
+            log::debug!("Rendered and copied frame to framebuffer");
+        } else {
+            log::warn!("Failed to map output buffer");
+        }
+
+        // Unmap the buffer
+        drop(output_buffer);
+
+        // Swap DRM buffers
+        if let Err(e) = self.drm_surface.swap_buffers() {
+            log::warn!("Failed to swap DRM buffers: {}", e);
+        }
+
+        Ok(())
+    }
+
+    pub fn run_loop(&mut self) -> anyhow::Result<()> {
+        log::info!("Starting DRM render loop");
+        
+        let start_time = Instant::now();
+        let mut frame_count = 0;
+        let max_frames = 300; // Run for ~5 seconds at 60fps
+        
+        loop {
+            let frame_start = Instant::now();
+            
+            self.update();
+            
+            if let Err(e) = self.render() {
+                log::error!("Render error: {}", e);
+                return Err(e);
+            }
+            
+            frame_count += 1;
+            
+            // Print progress every 60 frames (once per second at 60fps)
+            if frame_count % 60 == 0 {
+                let elapsed = start_time.elapsed();
+                log::info!("Frame {}, elapsed: {:.2}s, FPS: {:.1}", 
+                    frame_count, 
+                    elapsed.as_secs_f32(),
+                    frame_count as f32 / elapsed.as_secs_f32()
+                );
+            }
+            
+            // Exit after rendering some frames
+            if frame_count >= max_frames {
+                log::info!("Completed {} frames, exiting", frame_count);
+                break;
+            }
+            
+            // Wait for vsync
+            if let Err(e) = self.drm_surface.wait_for_vblank() {
+                log::warn!("VBlank wait failed: {}", e);
+            }
+            
+            // Frame timing
+            let frame_time = frame_start.elapsed();
+            if frame_time < Duration::from_millis(16) {
+                std::thread::sleep(Duration::from_millis(16) - frame_time);
+            }
+        }
+        
         Ok(())
     }
 }
 
-pub struct App {
-    #[cfg(target_arch = "wasm32")]
-    proxy: Option<winit::event_loop::EventLoopProxy<State>>,
-    state: Option<State>,
-}
-
-impl App {
-    pub fn new(#[cfg(target_arch = "wasm32")] event_loop: &EventLoop<State>) -> Self {
-        #[cfg(target_arch = "wasm32")]
-        let proxy = Some(event_loop.create_proxy());
-        Self {
-            state: None,
-            #[cfg(target_arch = "wasm32")]
-            proxy,
-        }
-    }
-}
-
-impl ApplicationHandler<State> for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        #[allow(unused_mut)]
-        let mut window_attributes = Window::default_attributes();
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::JsCast;
-            use winit::platform::web::WindowAttributesExtWebSys;
-
-            const CANVAS_ID: &str = "canvas";
-
-            let window = wgpu::web_sys::window().unwrap_throw();
-            let document = window.document().unwrap_throw();
-            let canvas = document.get_element_by_id(CANVAS_ID).unwrap_throw();
-            let html_canvas_element = canvas.unchecked_into();
-            window_attributes = window_attributes.with_canvas(Some(html_canvas_element));
-        }
-
-        let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            // If we are not on web we can use pollster to
-            // await the
-            self.state = Some(pollster::block_on(State::new(window)).unwrap());
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            if let Some(proxy) = self.proxy.take() {
-                wasm_bindgen_futures::spawn_local(async move {
-                    assert!(
-                        proxy
-                            .send_event(
-                                State::new(window)
-                                    .await
-                                    .expect("Unable to create canvas!!!")
-                            )
-                            .is_ok()
-                    )
-                });
-            }
-        }
-    }
-
-    #[allow(unused_mut)]
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, mut event: State) {
-        #[cfg(target_arch = "wasm32")]
-        {
-            event.window.request_redraw();
-            event.resize(
-                event.window.inner_size().width,
-                event.window.inner_size().height,
-            );
-        }
-        self.state = Some(event);
-    }
-
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: winit::window::WindowId,
-        event: WindowEvent,
-    ) {
-        let state = match &mut self.state {
-            Some(canvas) => canvas,
-            None => return,
-        };
-
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => state.resize(size.width, size.height),
-            WindowEvent::RedrawRequested => {
-                state.update();
-                match state.render() {
-                    Ok(_) => {
-                        state.window.request_redraw();
-                    }
-                    // Reconfigure the surface if it's lost or outdated
-                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                        let size = state.window.inner_size();
-                        state.resize(size.width, size.height);
-                    }
-                    Err(e) => {
-                        log::error!("Unable to render {}", e);
-                    }
-                }
-            }
-            WindowEvent::MouseInput { state, button, .. } => match (button, state.is_pressed()) {
-                (MouseButton::Left, true) => {}
-                (MouseButton::Left, false) => {}
-                _ => {}
-            },
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(code),
-                        state: key_state,
-                        ..
-                    },
-                ..
-            } => state.handle_key(event_loop, code, key_state.is_pressed()),
-            _ => {}
-        }
-    }
-}
-
 pub fn run() -> anyhow::Result<()> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        env_logger::init();
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        console_log::init_with_level(log::Level::Info).unwrap_throw();
-    }
-
-    let event_loop = EventLoop::with_user_event().build()?;
-    let mut app = App::new(
-        #[cfg(target_arch = "wasm32")]
-        &event_loop,
-    );
-    event_loop.run_app(&mut app)?;
-
-    Ok(())
-}
-
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen(start)]
-pub fn run_web() -> Result<(), wasm_bindgen::JsValue> {
-    console_error_panic_hook::set_once();
-    run().unwrap_throw();
-
-    Ok(())
+    log::info!("Starting DRM-based wgpu application");
+    
+    let mut state = pollster::block_on(State::new())?;
+    state.run_loop()
 }
